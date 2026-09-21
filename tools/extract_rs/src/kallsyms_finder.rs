@@ -116,19 +116,36 @@ fn parse_token_table_at(image: &[u8], start: usize, digit_offset: usize) -> Opti
     }
 
     let index_offset = align_up(position, ALIGN);
-    if image
-        .get(position..index_offset)?
-        .iter()
-        .any(|byte| *byte != 0)
-    {
-        return None;
-    }
-    let index_end = index_offset.checked_add(TOKEN_INDEX_SIZE)?;
-    if index_end > image.len() || *token_offsets.last()? > u16::MAX as usize {
-        return None;
-    }
-    for (index, &expected) in token_offsets.iter().enumerate() {
-        if read_u16(image, index_offset + index * 2)? as usize != expected {
+    // Some kernels pad the region between the token table and token index
+    // with zeros beyond the 8-byte alignment. Search forward through the
+    // zero padding to find the actual token index (validated against the
+    // computed token offsets).
+    let mut index_offset = index_offset;
+    let max_search = index_offset + 0x1000; // bound search to 4 KiB
+    loop {
+        let index_end = index_offset.checked_add(TOKEN_INDEX_SIZE)?;
+        if index_end > image.len() {
+            return None;
+        }
+        if *token_offsets.last()? > u16::MAX as usize {
+            return None;
+        }
+        let mut ok = true;
+        for (index, &expected) in token_offsets.iter().enumerate() {
+            if read_u16(image, index_offset + index * 2)? as usize != expected {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            break;
+        }
+        // advance by 2 (u16 alignment) through zero padding
+        if index_offset + 2 > image.len() || read_u16(image, index_offset)? != 0 {
+            return None;
+        }
+        index_offset += 2;
+        if index_offset >= max_search {
             return None;
         }
     }
@@ -167,40 +184,57 @@ fn find_token_tables(image: &[u8]) -> Vec<TokenTable> {
 
 /// Read `kallsyms_markers` starting at `start`: first entry 0, every following
 /// delta within one name-block (0x200..=0x40000); bounded by `limit`.
+/// Tries both u32 (4-byte stride) and u64 (8-byte stride, low 32 bits) layouts.
 fn read_markers(image: &[u8], start: usize, limit: usize) -> Vec<u32> {
+    // Try u32 stride (standard layout)
+    if let Some(m) = read_markers_u32(image, start, limit) {
+        return m;
+    }
+    // Try u64 stride (low 32 bits of each u64, 8-byte stride)
+    read_markers_u64(image, start, limit)
+}
+
+fn read_markers_u32(image: &[u8], start: usize, limit: usize) -> Option<Vec<u32>> {
     if start % ALIGN != 0 || start.saturating_add(8) > limit {
-        return Vec::new();
+        return None;
     }
-    let Some(first) = read_u32(image, start) else {
-        return Vec::new();
-    };
-    let Some(second) = read_u32(image, start + 4) else {
-        return Vec::new();
-    };
-    if first != 0 || !(0x200..=0x40000).contains(&second) {
-        return Vec::new();
-    }
+    let Some(first) = read_u32(image, start) else { return None };
+    let Some(second) = read_u32(image, start + 4) else { return None };
+    if first != 0 || !(0x200..=0x40000).contains(&second) { return None }
 
     let mut markers = vec![first, second];
     let mut position = start + 8;
     while markers.len() < MAX_MARKERS && position.saturating_add(4) <= limit {
-        let Some(value) = read_u32(image, position) else {
-            break;
-        };
-        let Some(delta) = value.checked_sub(*markers.last().expect("non-empty markers")) else {
-            break;
-        };
-        if !(0x200..=0x40000).contains(&delta) {
-            break;
-        }
+        let Some(value) = read_u32(image, position) else { break };
+        let Some(delta) = value.checked_sub(*markers.last()?) else { break };
+        if !(0x200..=0x40000).contains(&delta) { break };
         markers.push(value);
         position += 4;
     }
-    if markers.len() < MIN_MARKERS {
-        Vec::new()
-    } else {
-        markers
+    if markers.len() < MIN_MARKERS { None } else { Some(markers) }
+}
+
+fn read_markers_u64(image: &[u8], start: usize, limit: usize) -> Option<Vec<u32>> {
+    if start % ALIGN != 0 || start.saturating_add(16) > limit {
+        return None;
     }
+    let Some(first) = read_u64(image, start) else { return None };
+    if first != 0 { return None };
+    let Some(second) = read_u64(image, start + 8) else { return None };
+    let second32 = second as u32;
+    if !(0x200..=0x40000).contains(&second32) { return None };
+
+    let mut markers = vec![0, second32];
+    let mut position = start + 16;
+    while markers.len() < MAX_MARKERS && position.saturating_add(8) <= limit {
+        let Some(value) = read_u64(image, position) else { break };
+        let value32 = value as u32;
+        let Some(delta) = value32.checked_sub(*markers.last()?) else { break };
+        if !(0x200..=0x40000).contains(&delta) { break };
+        markers.push(value32);
+        position += 8;
+    }
+    if markers.len() < MIN_MARKERS { None } else { Some(markers) }
 }
 
 /// Walk `count` length-prefixed name entries; every 256th entry must match the
