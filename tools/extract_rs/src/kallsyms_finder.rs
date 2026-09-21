@@ -640,3 +640,5 @@ pub fn recover(image: &[u8], btf: Option<(usize, usize)>) -> Result<Kallsyms> {
     }
     Ok(Kallsyms { symbols, types })
 }
+ 
+ 
