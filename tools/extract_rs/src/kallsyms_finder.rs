@@ -370,50 +370,51 @@ fn find_name_tables(image: &[u8], tokens: &[Vec<u8>], token_table_offset: usize)
                     Some(padding) if padding == [0u8; 4]
                 );
                 if (minimum_count..=maximum_count).contains(&count) && padding_is_zero {
-                // Some kernels insert extra padding between num_syms and the names
-                // table. Scan forward from the expected start to find the actual
-                // names table.
-                let base_names_offset = num_syms_offset + ALIGN;
-                let max_scan = (base_names_offset + 0x1000).min(markers_offset);
-                let mut names_offset = base_names_offset;
-                while names_offset < max_scan {
-                    let mut seen_spans: Vec<Vec<(usize, usize)>> = Vec::new();
-                    let mut found = false;
-                    for uleb128_lengths in [true, false] {
-                        let Some(spans) = parse_name_spans(
-                            image,
-                            names_offset,
-                            count,
-                            markers_offset,
-                            &markers,
-                            uleb128_lengths,
-                        ) else {
-                            continue;
-                        };
-                        if seen_spans.contains(&spans) {
-                            continue;
-                        }
-                        seen_spans.push(spans.clone());
-                        if let Some(decoded) = decode_names(image, &spans, tokens) {
-                            recovered.push((
-                                num_syms_offset,
+                    // Some kernels insert extra padding between num_syms and the names
+                    // table. Scan forward from the expected start to find the actual
+                    // names table.
+                    let base_names_offset = num_syms_offset + ALIGN;
+                    let max_scan = (base_names_offset + 0x1000).min(markers_offset);
+                    let mut names_offset = base_names_offset;
+                    while names_offset < max_scan {
+                        let mut seen_spans: Vec<Vec<(usize, usize)>> = Vec::new();
+                        let mut found = false;
+                        for uleb128_lengths in [true, false] {
+                            let Some(spans) = parse_name_spans(
+                                image,
                                 names_offset,
+                                count,
                                 markers_offset,
-                                decoded,
-                            ));
-                            found = true;
+                                &markers,
+                                uleb128_lengths,
+                            ) else {
+                                continue;
+                            };
+                            if seen_spans.contains(&spans) {
+                                continue;
+                            }
+                            seen_spans.push(spans.clone());
+                            if let Some(decoded) = decode_names(image, &spans, tokens) {
+                                recovered.push((
+                                    num_syms_offset,
+                                    names_offset,
+                                    markers_offset,
+                                    decoded,
+                                ));
+                                found = true;
+                            }
                         }
+                        if found {
+                            break;
+                        }
+                        // Advance by 1 byte through padding (names start is typically
+                        // not far from the standard offset).
+                        names_offset += 1;
                     }
-                    if found {
-                        break;
-                    }
-                    // Advance by 1 byte through padding (names start is typically
-                    // not far from the standard offset).
-                    names_offset += 1;
+                    // If we exhausted the scan without finding a valid names table,
+                    // fall back to the standard offset for the remaining uleb128 attempt
+                    // (already covered by the loop above when names_offset == base_names_offset).
                 }
-                // If we exhausted the scan without finding a valid names table,
-                // fall back to the standard offset for the remaining uleb128 attempt
-                // (already covered by the loop above when names_offset == base_names_offset).
             }
             if num_syms_offset < search_start.saturating_add(ALIGN) {
                 break;
@@ -640,5 +641,3 @@ pub fn recover(image: &[u8], btf: Option<(usize, usize)>) -> Result<Kallsyms> {
     }
     Ok(Kallsyms { symbols, types })
 }
- 
- 
