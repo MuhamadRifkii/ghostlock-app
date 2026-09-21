@@ -191,7 +191,7 @@ fn read_markers(image: &[u8], start: usize, limit: usize) -> Vec<u32> {
         return m;
     }
     // Try u64 stride (low 32 bits of each u64, 8-byte stride)
-    read_markers_u64(image, start, limit)
+    read_markers_u64(image, start, limit).unwrap_or_default()
 }
 
 fn read_markers_u32(image: &[u8], start: usize, limit: usize) -> Option<Vec<u32>> {
