@@ -1,4 +1,4 @@
-//! Boot image parsing: Android boot v3/v4, raw arm64 Image, gzip, LZ4 legacy.
+//! Boot image parsing: Android boot v2/v3/v4, raw arm64 Image, gzip, LZ4 legacy.
 
 use std::path::Path;
 
@@ -180,6 +180,70 @@ mod tests {
         let out = decompress_lz4_legacy_frame(&frame).expect("chunked frame must decode");
         assert_eq!(out, expected);
     }
+
+    fn put_u32(raw: &mut [u8], offset: usize, value: u32) {
+        raw[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn parses_boot_header_v2() {
+        // v2 keeps page_size at offset 36 and starts the kernel at page 1;
+        // offset 20 holds ramdisk_addr, which must not be read as header_size.
+        let page_size = 2048usize;
+        let kernel = vec![0x90u8; 0x8000];
+        let mut raw = vec![0u8; page_size + kernel.len()];
+        raw[..8].copy_from_slice(ANDROID_MAGIC);
+        put_u32(&mut raw, 8, kernel.len() as u32);
+        put_u32(&mut raw, 20, 0x1000_0000); // ramdisk_addr, deliberately non-aligned
+        put_u32(&mut raw, 36, page_size as u32);
+        put_u32(&mut raw, 40, 2);
+        raw[page_size..].copy_from_slice(&kernel);
+        let img = BootImage::from_android_boot(raw).expect("v2 header must parse");
+        assert_eq!(img.kernel, kernel);
+        assert!(!img.mtk_lz4 && !img.mtk_gzip);
+    }
+
+    #[test]
+    fn parses_boot_header_v3() {
+        let kernel = vec![0x90u8; 0x8000];
+        let header_size = 1580usize;
+        let start = align(header_size, PAGE_SIZE);
+        let mut raw = vec![0u8; start + kernel.len()];
+        raw[..8].copy_from_slice(ANDROID_MAGIC);
+        put_u32(&mut raw, 8, kernel.len() as u32);
+        put_u32(&mut raw, 20, header_size as u32);
+        put_u32(&mut raw, 40, 3);
+        raw[start..].copy_from_slice(&kernel);
+        let img = BootImage::from_android_boot(raw).expect("v3 header must parse");
+        assert_eq!(img.kernel, kernel);
+    }
+
+    #[test]
+    fn rejects_boot_header_v1() {
+        let mut raw = vec![0u8; 64];
+        raw[..8].copy_from_slice(ANDROID_MAGIC);
+        put_u32(&mut raw, 40, 1);
+        assert!(BootImage::from_android_boot(raw).is_err());
+    }
+
+    #[test]
+    fn rejects_v2_with_invalid_page_size() {
+        let mut raw = vec![0u8; 64];
+        raw[..8].copy_from_slice(ANDROID_MAGIC);
+        put_u32(&mut raw, 36, 1000); // inside the length range, not a power of two
+        put_u32(&mut raw, 40, 2);
+        assert!(BootImage::from_android_boot(raw).is_err());
+    }
+
+    #[test]
+    fn rejects_v2_kernel_past_end() {
+        let mut raw = vec![0u8; 64];
+        raw[..8].copy_from_slice(ANDROID_MAGIC);
+        put_u32(&mut raw, 8, 0x1_0000); // kernel_size far beyond the buffer
+        put_u32(&mut raw, 36, 2048);
+        put_u32(&mut raw, 40, 2);
+        assert!(BootImage::from_android_boot(raw).is_err());
+    }
 }
 
 pub struct BootImage {
@@ -214,14 +278,27 @@ impl BootImage {
             return Err(ExtractError::new("truncated Android boot header"));
         }
         let kernel_size = u32::from_le_bytes(raw[8..12].try_into().unwrap()) as usize;
-        let header_size = u32::from_le_bytes(raw[20..24].try_into().unwrap()) as usize;
         let version = u32::from_le_bytes(raw[40..44].try_into().unwrap());
-        if !(version == 3 || version == 4) {
-            return Err(ExtractError::new(format!(
-                "unsupported boot header version {version}"
-            )));
-        }
-        let start = align(header_size, PAGE_SIZE);
+        let start = match version {
+            3 | 4 => {
+                let header_size = u32::from_le_bytes(raw[20..24].try_into().unwrap()) as usize;
+                align(header_size, PAGE_SIZE)
+            }
+            2 => {
+                // v2 keeps page_size at offset 36 and the kernel starts at
+                // page 1; offset 20 is ramdisk_addr, not header_size.
+                let page_size = u32::from_le_bytes(raw[36..40].try_into().unwrap()) as usize;
+                if !(512..=0x10000).contains(&page_size) || page_size & (page_size - 1) != 0 {
+                    return Err(ExtractError::new(format!("invalid page size {page_size}")));
+                }
+                page_size
+            }
+            _ => {
+                return Err(ExtractError::new(format!(
+                    "unsupported boot header version {version}"
+                )))
+            }
+        };
         let end = start + kernel_size;
         if end > raw.len() {
             return Err(ExtractError::new("kernel payload exceeds boot image"));
